@@ -1,479 +1,247 @@
-# ============================================================
-# PROFILOMETER PROFILE ALIGNMENT + AVERAGING APP
-# ============================================================
-#
-# Designed for profilometer exports such as:
-#
-# Meta Data
-# ...
-# Data
-# Lateral(µm),Total Profile(Å),,
-# 0,-5528.24,,
-# 0.77769,-5547.78,,
-# ...
-#
-# FEATURES
-# ------------------------------------------------------------
-# - Upload multiple profilometer CSV files
-# - Handles metadata before the Data section
-# - Handles extra trailing commas
-# - Automatically identifies Lateral / Total Profile columns
-# - Individual X shift
-# - Individual Y shift
-# - Individual left/right trimming
-# - High spike removal
-# - Low spike removal
-# - High + low spike removal
-# - Removed spikes shown in red
-# - Robust MAD-based spike detection
-# - Common overlap averaging
-# - Standard deviation
-# - Final average trimming
-# - Ra / Rq / Rt
-# - Multiple CSV exports
-#
-# ============================================================
-
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
 from scipy.ndimage import median_filter
-
-from io import BytesIO
+import io
+import re
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="Profilometer Profile Averaging",
+    page_title="Profilometer Profile Averaging Tool",
     layout="wide"
 )
 
+st.title("Profilometer Profile Alignment & Averaging Tool")
 
-st.title(
-    "Profilometer Profile Alignment & Averaging"
-)
-
-
-st.caption(
-    "Align, trim, remove spikes, and average profilometer profiles."
-)
+st.markdown("""
+Upload multiple profilometer CSV files, adjust each profile individually,
+remove spikes, align the profiles, calculate the average, and apply final
+truncation before exporting the final result.
+""")
 
 
 # ============================================================
-# FILE LOADER
+# LOAD PROFILE
 # ============================================================
 
 def load_profile(uploaded_file):
-    """
-    Load profilometer CSV files with metadata and inconsistent
-    trailing commas.
 
-    Specifically supports files containing:
+    try:
+        raw_bytes = uploaded_file.getvalue()
 
-        Data
-        Lateral(µm),Total Profile(Å),,
-        x,z,,
+        # Try several common encodings
+        text = None
 
-    Extra columns are ignored.
-    """
+        for encoding in ["utf-8", "utf-8-sig", "latin1", "cp1252"]:
+            try:
+                text = raw_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
 
-    # --------------------------------------------------------
-    # Read raw bytes
-    # --------------------------------------------------------
+        if text is None:
+            raise ValueError("Could not decode file.")
 
-    file_bytes = uploaded_file.getvalue()
+        lines = text.splitlines()
 
-    # Try UTF-8 first, then common alternatives
-    text = None
+        # ----------------------------------------------------
+        # Find the appropriate header
+        # ----------------------------------------------------
 
-    encodings = [
-        "utf-8",
-        "utf-8-sig",
-        "latin1",
-        "cp1252"
-    ]
-
-    for encoding in encodings:
-
-        try:
-
-            text = file_bytes.decode(
-                encoding
-            )
-
-            break
-
-        except UnicodeDecodeError:
-
-            continue
-
-    if text is None:
-
-        raise ValueError(
-            "Could not decode the file."
-        )
-
-    # --------------------------------------------------------
-    # Split into lines
-    # --------------------------------------------------------
-
-    lines = text.splitlines()
-
-    if len(lines) == 0:
-
-        raise ValueError(
-            "The CSV file is empty."
-        )
-
-    # --------------------------------------------------------
-    # Find the actual data header
-    #
-    # We specifically look for:
-    #
-    # Lateral
-    # Total Profile
-    #
-    # --------------------------------------------------------
-
-    header_index = None
-
-    for i, line in enumerate(lines):
-
-        lower_line = (
-            line.strip()
-            .lower()
-        )
-
-        if (
-            "lateral" in lower_line
-            and
-            "total profile" in lower_line
-        ):
-
-            header_index = i
-
-            break
-
-    # --------------------------------------------------------
-    # If the exact profilometer format wasn't found,
-    # look for a Data marker and then inspect the next rows.
-    # --------------------------------------------------------
-
-    if header_index is None:
-
-        data_marker_index = None
+        header_index = None
+        distance_col = None
+        height_col = None
 
         for i, line in enumerate(lines):
 
-            if line.strip().lower() == "data":
-
-                data_marker_index = i
-
-                break
-
-        if data_marker_index is not None:
-
-            for i in range(
-                data_marker_index + 1,
-                min(
-                    data_marker_index + 20,
-                    len(lines)
-                )
-            ):
-
-                lower_line = (
-                    lines[i]
-                    .strip()
-                    .lower()
-                )
-
-                if (
-                    "lateral" in lower_line
-                    or
-                    "distance" in lower_line
-                ):
-
-                    header_index = i
-
-                    break
-
-    # --------------------------------------------------------
-    # If still not found, attempt generic CSV detection
-    # --------------------------------------------------------
-
-    if header_index is None:
-
-        try:
-
-            preview = pd.read_csv(
-                BytesIO(file_bytes),
-                header=None,
-                nrows=50,
-                engine="python",
-                encoding="latin1"
-            )
-
-        except Exception as e:
-
-            raise ValueError(
-                f"Could not inspect CSV: {e}"
-            )
-
-        for i in range(
-            len(preview)
-        ):
-
-            row = (
-                preview.iloc[i]
-                .astype(str)
-                .str.lower()
-            )
-
-            row_text = " ".join(
-                row.tolist()
-            )
+            lower = line.lower()
 
             if (
-                "distance" in row_text
-                and
-                (
-                    "height" in row_text
-                    or
-                    "profile" in row_text
-                )
+                "lateral" in lower
+                and "total profile" in lower
             ):
-
                 header_index = i
+
+                header_parts = line.split(",")
+
+                for j, part in enumerate(header_parts):
+
+                    p = part.strip().lower()
+
+                    if (
+                        distance_col is None
+                        and (
+                            "lateral" in p
+                            or "distance" in p
+                            or "x" == p
+                        )
+                    ):
+                        distance_col = j
+
+                    if (
+                        height_col is None
+                        and (
+                            "total profile" in p
+                            or "height" in p
+                            or "profile" in p
+                        )
+                    ):
+                        height_col = j
 
                 break
 
-    # --------------------------------------------------------
-    # Final failure
-    # --------------------------------------------------------
-
-    if header_index is None:
-
-        raise ValueError(
-            "Could not find the profilometer data header. "
-            "Expected columns such as "
-            "'Lateral(µm)' and 'Total Profile(Å)'."
-        )
-
-    # ========================================================
-    # PARSE THE DATA MANUALLY
-    # ========================================================
-    #
-    # This is the important fix.
-    #
-    # We do NOT let Pandas decide how many columns the row
-    # should have.
-    #
-    # We only take the first two fields:
-    #
-    #     Distance
-    #     Height
-    #
-    # This handles:
-    #
-    #     0,-5528.24,,
-    #
-    # without throwing an error.
-    # ========================================================
-
-    header_parts = (
-        lines[header_index]
-        .strip()
-        .split(",")
-    )
-
-    # --------------------------------------------------------
-    # Identify distance and height column indices
-    # --------------------------------------------------------
-
-    distance_index = None
-    height_index = None
-
-    for i, column in enumerate(
-        header_parts
-    ):
-
-        column_clean = (
-            column
-            .strip()
-            .lower()
-        )
-
-        if (
-            distance_index is None
-            and
-            (
-                "lateral" in column_clean
-                or
-                "distance" in column_clean
-                or
-                "position" in column_clean
-            )
-        ):
-
-            distance_index = i
-
-        if (
-            height_index is None
-            and
-            (
-                "total profile" in column_clean
-                or
-                "height" in column_clean
-                or
-                "elevation" in column_clean
-                or
-                "profile" in column_clean
-            )
-        ):
-
-            height_index = i
-
-    # --------------------------------------------------------
-    # If named columns weren't found, assume first two
-    # --------------------------------------------------------
-
-    if (
-        distance_index is None
-        or
-        height_index is None
-    ):
-
-        distance_index = 0
-        height_index = 1
-
-    # --------------------------------------------------------
-    # Read data lines
-    # --------------------------------------------------------
-
-    distance_values = []
-    height_values = []
-
-    for line in lines[
-        header_index + 1:
-    ]:
-
-        line = line.strip()
-
-        if not line:
-
-            continue
-
-        # Ignore obvious metadata / section markers
-        if line.lower() in [
-            "data",
-            "metadata"
-        ]:
-
-            continue
-
-        parts = line.split(",")
-
-        # Need enough fields
-        if (
-            len(parts)
-            <= max(
-                distance_index,
-                height_index
-            )
-        ):
-
-            continue
-
-        distance_string = (
-            parts[distance_index]
-            .strip()
-        )
-
-        height_string = (
-            parts[height_index]
-            .strip()
-        )
-
         # ----------------------------------------------------
-        # Convert to numeric
+        # If no standard header found, look after Data marker
         # ----------------------------------------------------
 
-        try:
+        if header_index is None:
 
-            distance = float(
-                distance_string
+            data_index = None
+
+            for i, line in enumerate(lines):
+                if line.strip().lower() == "data":
+                    data_index = i
+                    break
+
+            if data_index is not None:
+
+                for i in range(data_index + 1, len(lines)):
+
+                    lower = lines[i].lower()
+
+                    if (
+                        "lateral" in lower
+                        or "distance" in lower
+                    ):
+
+                        header_index = i
+                        header_parts = lines[i].split(",")
+
+                        for j, part in enumerate(header_parts):
+
+                            p = part.strip().lower()
+
+                            if (
+                                distance_col is None
+                                and (
+                                    "lateral" in p
+                                    or "distance" in p
+                                    or "x" == p
+                                )
+                            ):
+                                distance_col = j
+
+                            if (
+                                height_col is None
+                                and (
+                                    "total profile" in p
+                                    or "height" in p
+                                    or "profile" in p
+                                )
+                            ):
+                                height_col = j
+
+                        break
+
+        # ----------------------------------------------------
+        # Generic fallback
+        # ----------------------------------------------------
+
+        if header_index is None:
+
+            for i, line in enumerate(lines):
+
+                parts = line.split(",")
+
+                if len(parts) >= 2:
+
+                    try:
+                        float(parts[0].strip())
+                        float(parts[1].strip())
+
+                        header_index = i - 1
+                        distance_col = 0
+                        height_col = 1
+                        break
+
+                    except ValueError:
+                        continue
+
+        if header_index is None:
+            raise ValueError(
+                "Could not find profile data in this file."
             )
 
-            height = float(
-                height_string
+        if distance_col is None:
+            distance_col = 0
+
+        if height_col is None:
+            height_col = 1
+
+        # ----------------------------------------------------
+        # Manually read data
+        # This avoids errors from extra trailing commas
+        # ----------------------------------------------------
+
+        x_values = []
+        y_values = []
+
+        for line in lines[header_index + 1:]:
+
+            if not line.strip():
+                continue
+
+            parts = line.split(",")
+
+            if len(parts) <= max(distance_col, height_col):
+                continue
+
+            try:
+
+                x = float(parts[distance_col].strip())
+                y = float(parts[height_col].strip())
+
+                if np.isfinite(x) and np.isfinite(y):
+
+                    x_values.append(x)
+                    y_values.append(y)
+
+            except (ValueError, TypeError):
+                continue
+
+        if len(x_values) < 2:
+            raise ValueError(
+                "Could not find enough numeric profile data."
             )
 
-        except (ValueError, TypeError):
+        x = np.asarray(x_values, dtype=float)
+        y = np.asarray(y_values, dtype=float)
 
-            continue
+        # Sort by X
+        order = np.argsort(x)
 
-        if (
-            np.isfinite(distance)
-            and
-            np.isfinite(height)
-        ):
+        x = x[order]
+        y = y[order]
 
-            distance_values.append(
-                distance
-            )
-
-            height_values.append(
-                height
-            )
-
-    # --------------------------------------------------------
-    # Make dataframe
-    # --------------------------------------------------------
-
-    clean = pd.DataFrame({
-        "Distance": distance_values,
-        "Height": height_values
-    })
-
-    # --------------------------------------------------------
-    # Check data
-    # --------------------------------------------------------
-
-    if len(clean) < 5:
-
-        raise ValueError(
-            f"Only {len(clean)} valid profile points "
-            "were found."
+        # Remove duplicate X values
+        unique_x, unique_indices = np.unique(
+            x,
+            return_index=True
         )
 
-    # --------------------------------------------------------
-    # Remove duplicate X values
-    # --------------------------------------------------------
+        x = unique_x
+        y = y[unique_indices]
 
-    clean = clean.drop_duplicates(
-        subset="Distance",
-        keep="first"
-    )
+        return x, y
 
-    # --------------------------------------------------------
-    # Sort by distance
-    # --------------------------------------------------------
+    except Exception as e:
 
-    clean = clean.sort_values(
-        "Distance"
-    )
-
-    clean = clean.reset_index(
-        drop=True
-    )
-
-    return clean
+        raise ValueError(str(e))
 
 
 # ============================================================
@@ -482,217 +250,86 @@ def load_profile(uploaded_file):
 
 def remove_spikes(
     height,
-    window,
-    threshold,
-    mode
+    window=11,
+    threshold=5.0,
+    mode="High spikes only"
 ):
-    """
-    Remove local spikes using a robust median/MAD approach.
 
-    Modes:
-        Off
-        High spikes only
-        Low spikes only
-        High + low spikes
+    y = np.asarray(height, dtype=float).copy()
 
-    Returns:
-        cleaned profile
-        spike mask
-    """
-
-    height = np.asarray(
-        height,
-        dtype=float
-    )
-
-    n = len(height)
-
-    # --------------------------------------------------------
-    # OFF
-    # --------------------------------------------------------
-
-    if mode == "Off":
-
-        return (
-            height.copy(),
-            np.zeros(
-                n,
-                dtype=bool
-            )
-        )
+    n = len(y)
 
     if n < 5:
+        return y, np.zeros(n, dtype=bool)
 
-        return (
-            height.copy(),
-            np.zeros(
-                n,
-                dtype=bool
-            )
-        )
-
-    # --------------------------------------------------------
-    # Make window odd
-    # --------------------------------------------------------
-
-    window = int(window)
-
-    if window < 3:
-
-        window = 3
-
+    # Ensure odd window
     if window % 2 == 0:
-
         window += 1
 
-    # Do not exceed data length
-    if window > n:
+    window = max(3, window)
 
-        window = n
-
-        if window % 2 == 0:
-
-            window -= 1
+    if window >= n:
+        window = n if n % 2 == 1 else n - 1
 
     if window < 3:
+        return y, np.zeros(n, dtype=bool)
 
-        return (
-            height.copy(),
-            np.zeros(
-                n,
-                dtype=bool
-            )
-        )
-
-    # --------------------------------------------------------
     # Local median
-    #
-    # reflect avoids artificial zero padding
-    # --------------------------------------------------------
-
     local_median = median_filter(
-        height,
+        y,
         size=window,
         mode="reflect"
     )
 
-    # --------------------------------------------------------
-    # Residual
-    # --------------------------------------------------------
+    residual = y - local_median
 
-    residual = (
-        height
-        -
-        local_median
-    )
-
-    # --------------------------------------------------------
     # Robust MAD
-    # --------------------------------------------------------
-
-    residual_median = np.median(
-        residual
-    )
+    median_residual = np.median(residual)
 
     mad = np.median(
-        np.abs(
-            residual
-            -
-            residual_median
-        )
+        np.abs(residual - median_residual)
     )
 
-    if mad > 0:
+    # Convert MAD to sigma-like quantity
+    sigma = 1.4826 * mad
 
-        sigma = (
-            1.4826
-            *
-            mad
-        )
+    if sigma <= 0 or not np.isfinite(sigma):
 
-    else:
+        return y, np.zeros(n, dtype=bool)
 
-        sigma = np.std(
-            residual
-        )
+    if mode == "High spikes only":
 
-    # --------------------------------------------------------
-    # Determine spikes
-    # --------------------------------------------------------
-
-    if (
-        sigma == 0
-        or
-        not np.isfinite(sigma)
-    ):
-
-        spike_mask = np.zeros(
-            n,
-            dtype=bool
-        )
-
-    elif mode == "High spikes only":
-
-        spike_mask = (
-            residual
-            >
-            threshold * sigma
-        )
+        spike_mask = residual > threshold * sigma
 
     elif mode == "Low spikes only":
 
-        spike_mask = (
-            residual
-            <
-            -threshold * sigma
-        )
+        spike_mask = residual < -threshold * sigma
 
     elif mode == "High + low spikes":
 
         spike_mask = (
             np.abs(residual)
-            >
-            threshold * sigma
+            > threshold * sigma
         )
 
     else:
 
-        spike_mask = np.zeros(
-            n,
-            dtype=bool
-        )
+        spike_mask = np.zeros(n, dtype=bool)
 
-    # --------------------------------------------------------
-    # Replace spikes with local median
-    # --------------------------------------------------------
+    corrected = y.copy()
 
-    cleaned = height.copy()
+    corrected[spike_mask] = local_median[spike_mask]
 
-    cleaned[
-        spike_mask
-    ] = local_median[
-        spike_mask
-    ]
-
-    return (
-        cleaned,
-        spike_mask
-    )
+    return corrected, spike_mask
 
 
 # ============================================================
 # METRICS
 # ============================================================
 
-def calculate_metrics(
-    x,
-    height
-):
-    """
-    Calculate Ra, Rq and Rt.
-    """
+def calculate_metrics(x, y):
 
-    if len(height) == 0:
+    if len(y) == 0:
 
         return {
             "Ra": np.nan,
@@ -700,28 +337,12 @@ def calculate_metrics(
             "Rt": np.nan
         }
 
-    # Remove mean line
-    centered = (
-        height
-        -
-        np.mean(height)
-    )
+    # Center profile around mean
+    centered = y - np.mean(y)
 
-    Ra = np.mean(
-        np.abs(centered)
-    )
-
-    Rq = np.sqrt(
-        np.mean(
-            centered ** 2
-        )
-    )
-
-    Rt = (
-        np.max(centered)
-        -
-        np.min(centered)
-    )
+    Ra = np.mean(np.abs(centered))
+    Rq = np.sqrt(np.mean(centered ** 2))
+    Rt = np.max(y) - np.min(y)
 
     return {
         "Ra": Ra,
@@ -731,136 +352,72 @@ def calculate_metrics(
 
 
 # ============================================================
-# INTERPOLATION / ALIGNMENT
+# INTERPOLATION
 # ============================================================
 
-def interpolate_profiles(
-    profiles
-):
-    """
-    Put all corrected profiles onto a common distance grid.
-
-    Only the region shared by ALL profiles is averaged.
-    """
+def interpolate_profiles(profiles):
 
     if len(profiles) == 0:
+        return None
 
-        return None, None
+    # Find common overlap
+    x_mins = [np.min(p["x"]) for p in profiles]
+    x_maxs = [np.max(p["x"]) for p in profiles]
 
-    # --------------------------------------------------------
-    # Common overlap
-    # --------------------------------------------------------
+    common_min = max(x_mins)
+    common_max = min(x_maxs)
 
-    xmin = max(
-        profile["Distance"].min()
-        for profile in profiles
-    )
-
-    xmax = min(
-        profile["Distance"].max()
-        for profile in profiles
-    )
-
-    if xmin >= xmax:
+    if common_min >= common_max:
 
         raise ValueError(
-            "The profiles do not have a common "
-            "overlapping distance range."
+            "The profiles do not have a common X-overlap."
         )
 
-    # --------------------------------------------------------
-    # Determine representative spacing
-    # --------------------------------------------------------
-
+    # Determine approximate spacing
     spacings = []
 
-    for profile in profiles:
+    for p in profiles:
 
-        dx = np.diff(
-            profile["Distance"].values
-        )
+        dx = np.diff(p["x"])
 
-        dx = dx[
-            np.isfinite(dx)
-            &
-            (dx > 0)
-        ]
+        dx = dx[np.isfinite(dx) & (dx > 0)]
 
         if len(dx) > 0:
-
-            spacings.append(
-                np.median(dx)
-            )
+            spacings.append(np.median(dx))
 
     if len(spacings) == 0:
 
-        spacing = (
-            xmax - xmin
-        ) / 1000
-
-    else:
-
-        spacing = np.median(
-            spacings
-        )
-
-    if spacing <= 0:
-
         raise ValueError(
-            "Could not determine profile spacing."
+            "Could not determine X spacing."
         )
 
-    # --------------------------------------------------------
-    # Common X grid
-    # --------------------------------------------------------
+    common_dx = np.median(spacings)
 
-    common_x = np.arange(
-        xmin,
-        xmax + spacing,
-        spacing
+    n_points = int(
+        np.floor(
+            (common_max - common_min)
+            / common_dx
+        )
+    ) + 1
+
+    common_x = (
+        common_min
+        + np.arange(n_points) * common_dx
     )
 
-    # Make sure last point isn't outside overlap
-    common_x = common_x[
-        common_x <= xmax
-    ]
+    interpolated = []
 
-    # --------------------------------------------------------
-    # Interpolate
-    # --------------------------------------------------------
+    for p in profiles:
 
-    aligned = []
-
-    for profile in profiles:
-
-        x = (
-            profile["Distance"]
-            .values
-        )
-
-        z = (
-            profile["Height"]
-            .values
-        )
-
-        z_interp = np.interp(
+        y_interp = np.interp(
             common_x,
-            x,
-            z
+            p["x"],
+            p["y"]
         )
 
-        aligned.append(
-            z_interp
-        )
+        interpolated.append(y_interp)
 
-    aligned = np.asarray(
-        aligned
-    )
-
-    return (
-        common_x,
-        aligned
-    )
+    return common_x, np.asarray(interpolated)
 
 
 # ============================================================
@@ -868,215 +425,174 @@ def interpolate_profiles(
 # ============================================================
 
 if "profiles" not in st.session_state:
-
     st.session_state.profiles = {}
 
 
 # ============================================================
-# UPLOAD
+# FILE UPLOAD
 # ============================================================
 
-st.header(
-    "1. Upload Profiles"
-)
+st.header("1. Upload Profiles")
 
 uploaded_files = st.file_uploader(
-    "Upload one or more profilometer CSV files",
-    type=["csv"],
+    "Upload profilometer CSV files",
+    type=["csv", "txt"],
     accept_multiple_files=True
 )
 
-
-# ============================================================
-# LOAD FILES
-# ============================================================
 
 if uploaded_files:
 
     for uploaded_file in uploaded_files:
 
-        name = uploaded_file.name
+        filename = uploaded_file.name
 
-        try:
+        if filename not in st.session_state.profiles:
 
-            df = load_profile(
-                uploaded_file
-            )
+            try:
 
-            st.session_state.profiles[
-                name
-            ] = {
-                "raw": df
-            }
+                x, y = load_profile(uploaded_file)
 
-        except Exception as e:
+                st.session_state.profiles[filename] = {
+                    "original_x": x,
+                    "original_y": y
+                }
 
-            st.error(
-                f"Could not load {name}: {e}"
-            )
+            except Exception as e:
+
+                st.error(
+                    f"Could not load {filename}: {e}"
+                )
 
 
-# ============================================================
-# STOP IF NOTHING LOADED
-# ============================================================
+profiles = st.session_state.profiles
 
-if len(
-    st.session_state.profiles
-) == 0:
+
+if not profiles:
 
     st.info(
-        "Upload one or more CSV files to begin."
+        "Upload one or more profilometer CSV files to begin."
     )
 
     st.stop()
 
 
 # ============================================================
-# LOADED FILE SUMMARY
+# LOADED PROFILE SUMMARY
 # ============================================================
 
-st.success(
-    f"{len(st.session_state.profiles)} "
-    "profile(s) loaded successfully."
-)
+st.subheader("Loaded Profiles")
 
+summary_rows = []
 
-loaded_summary = []
+for name, p in profiles.items():
 
-for name, info in (
-    st.session_state.profiles.items()
-):
-
-    df = info["raw"]
-
-    loaded_summary.append({
+    summary_rows.append({
         "File": name,
-        "Points": len(df),
-        "Distance min": df["Distance"].min(),
-        "Distance max": df["Distance"].max(),
-        "Height min": df["Height"].min(),
-        "Height max": df["Height"].max()
+        "Points": len(p["original_x"]),
+        "X Min": np.min(p["original_x"]),
+        "X Max": np.max(p["original_x"]),
+        "Height Min": np.min(p["original_y"]),
+        "Height Max": np.max(p["original_y"])
     })
 
-
-loaded_summary_df = pd.DataFrame(
-    loaded_summary
-)
+summary_df = pd.DataFrame(summary_rows)
 
 st.dataframe(
-    loaded_summary_df,
+    summary_df,
     use_container_width=True
 )
 
 
 # ============================================================
-# INDIVIDUAL SETTINGS
+# INDIVIDUAL PROFILE ADJUSTMENTS
 # ============================================================
 
-st.header(
-    "2. Individual Profile Settings"
-)
+st.header("2. Individual Profile Adjustments")
 
-st.write(
-    "These corrections are applied individually before "
-    "the profiles are averaged."
-)
-
-
-profile_names = list(
-    st.session_state.profiles.keys()
-)
-
-settings = {}
+st.markdown("""
+These adjustments are applied to each profile **before averaging**.
+The left/right trimming therefore removes those points from the
+average calculation entirely.
+""")
 
 
-for i, name in enumerate(
-    profile_names
+processed_profiles = []
+
+spike_summary = []
+
+for profile_number, (name, p) in enumerate(
+    profiles.items()
 ):
 
-    raw = (
-        st.session_state.profiles[
-            name
-        ]["raw"]
-        .copy()
-    )
+    with st.expander(
+        f"{name}",
+        expanded=True
+    ):
 
-    st.subheader(
-        f"Profile {i + 1}: {name}"
-    )
+        x_original = p["original_x"]
+        y_original = p["original_y"]
 
-    # --------------------------------------------------------
-    # SHIFT SETTINGS
-    # --------------------------------------------------------
-
-    col1, col2 = st.columns(2)
-
-    with col1:
+        # ----------------------------------------------------
+        # X SHIFT
+        # ----------------------------------------------------
 
         x_shift = st.number_input(
-            "X shift",
+            "X shift (µm)",
             value=0.0,
-            step=0.01,
+            step=0.1,
             format="%.4f",
-            key=f"xshift_{name}"
+            key=f"xshift_{profile_number}_{name}"
         )
 
-    with col2:
+        # ----------------------------------------------------
+        # Y SHIFT
+        # ----------------------------------------------------
 
         y_shift = st.number_input(
-            "Y shift",
+            "Y shift (Å)",
             value=0.0,
-            step=0.01,
+            step=1.0,
             format="%.4f",
-            key=f"yshift_{name}"
+            key=f"yshift_{profile_number}_{name}"
         )
 
-    # --------------------------------------------------------
-    # EDGE TRIMMING
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # EDGE TRIMMING
+        # ----------------------------------------------------
 
-    st.markdown(
-        "**Individual edge trimming**"
-    )
+        col1, col2 = st.columns(2)
 
-    col1, col2 = st.columns(2)
+        with col1:
 
-    with col1:
+            left_trim = st.number_input(
+                "Remove from LEFT edge (µm)",
+                value=0.0,
+                min_value=0.0,
+                step=1.0,
+                format="%.3f",
+                key=f"lefttrim_{profile_number}_{name}"
+            )
 
-        left_cut = st.number_input(
-            "Left cut",
-            min_value=0.0,
-            value=0.0,
-            step=0.01,
-            format="%.4f",
-            key=f"leftcut_{name}"
-        )
+        with col2:
 
-    with col2:
+            right_trim = st.number_input(
+                "Remove from RIGHT edge (µm)",
+                value=0.0,
+                min_value=0.0,
+                step=1.0,
+                format="%.3f",
+                key=f"righttrim_{profile_number}_{name}"
+            )
 
-        right_cut = st.number_input(
-            "Right cut",
-            min_value=0.0,
-            value=0.0,
-            step=0.01,
-            format="%.4f",
-            key=f"rightcut_{name}"
-        )
+        # ----------------------------------------------------
+        # SPIKE SETTINGS
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # SPIKE REMOVAL
-    # --------------------------------------------------------
-
-    st.markdown(
-        "**Spike removal**"
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
+        st.markdown("#### Spike Removal")
 
         spike_mode = st.selectbox(
-            "Spike mode",
+            "Spike removal mode",
             [
                 "Off",
                 "High spikes only",
@@ -1084,382 +600,215 @@ for i, name in enumerate(
                 "High + low spikes"
             ],
             index=1,
-            key=f"spike_mode_{name}"
+            key=f"spikemode_{profile_number}_{name}"
         )
 
-    with col2:
-
-        spike_window = st.slider(
-            "Spike window",
+        spike_window = st.number_input(
+            "Local median window",
             min_value=3,
-            max_value=51,
-            value=7,
+            max_value=101,
+            value=11,
             step=2,
-            key=f"spike_window_{name}",
-            help=(
-                "Number of neighboring points "
-                "used to calculate the local median."
-            )
+            key=f"spikewindow_{profile_number}_{name}"
         )
 
-    with col3:
-
-        spike_threshold = st.slider(
+        spike_threshold = st.number_input(
             "Spike threshold",
             min_value=1.0,
-            max_value=10.0,
+            max_value=20.0,
             value=5.0,
             step=0.5,
-            key=f"spike_threshold_{name}",
-            help=(
-                "Lower = more aggressive. "
-                "Higher = more conservative."
+            format="%.1f",
+            key=f"spikethreshold_{profile_number}_{name}"
+        )
+
+        # ----------------------------------------------------
+        # APPLY X/Y SHIFT
+        # ----------------------------------------------------
+
+        x_adjusted = x_original + x_shift
+        y_adjusted = y_original + y_shift
+
+        # ----------------------------------------------------
+        # REMOVE SPIKES
+        # ----------------------------------------------------
+
+        if spike_mode == "Off":
+
+            y_corrected = y_adjusted.copy()
+            spike_mask = np.zeros(
+                len(y_adjusted),
+                dtype=bool
             )
+
+        else:
+
+            y_corrected, spike_mask = remove_spikes(
+                y_adjusted,
+                window=spike_window,
+                threshold=spike_threshold,
+                mode=spike_mode
+            )
+
+        # ----------------------------------------------------
+        # EDGE TRIMMING
+        # ----------------------------------------------------
+
+        keep_mask = np.ones(
+            len(x_adjusted),
+            dtype=bool
         )
 
-    settings[name] = {
-        "x_shift": x_shift,
-        "y_shift": y_shift,
-        "left_cut": left_cut,
-        "right_cut": right_cut,
-        "spike_mode": spike_mode,
-        "spike_window": spike_window,
-        "spike_threshold": spike_threshold
-    }
+        x_min = np.min(x_adjusted)
+        x_max = np.max(x_adjusted)
 
-
-# ============================================================
-# PROCESS PROFILES
-# ============================================================
-
-st.header(
-    "3. Corrected Profiles"
-)
-
-
-corrected_profiles = []
-
-spike_summary = []
-
-
-for name in profile_names:
-
-    raw = (
-        st.session_state.profiles[
-            name
-        ]["raw"]
-        .copy()
-    )
-
-    s = settings[name]
-
-    # --------------------------------------------------------
-    # Original arrays
-    # --------------------------------------------------------
-
-    x = raw[
-        "Distance"
-    ].values.copy()
-
-    z = raw[
-        "Height"
-    ].values.copy()
-
-    # --------------------------------------------------------
-    # X shift
-    # --------------------------------------------------------
-
-    x = (
-        x
-        +
-        s["x_shift"]
-    )
-
-    # --------------------------------------------------------
-    # Y shift
-    # --------------------------------------------------------
-
-    z = (
-        z
-        +
-        s["y_shift"]
-    )
-
-    # --------------------------------------------------------
-    # INDIVIDUAL EDGE CUTTING
-    #
-    # IMPORTANT:
-    # These points are completely removed before averaging.
-    # --------------------------------------------------------
-
-    original_min = x.min()
-    original_max = x.max()
-
-    xmin = (
-        original_min
-        +
-        s["left_cut"]
-    )
-
-    xmax = (
-        original_max
-        -
-        s["right_cut"]
-    )
-
-    if xmin >= xmax:
-
-        st.error(
-            f"{name}: left/right trimming removes "
-            "the entire profile."
+        keep_mask &= (
+            x_adjusted
+            >= x_min + left_trim
         )
 
-        st.stop()
+        keep_mask &= (
+            x_adjusted
+            <= x_max - right_trim
+        )
 
-    trim_mask = (
-        (x >= xmin)
-        &
-        (x <= xmax)
-    )
+        x_final = x_adjusted[keep_mask]
+        y_final = y_corrected[keep_mask]
+        spikes_final = spike_mask[keep_mask]
 
-    x = x[
-        trim_mask
-    ]
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
 
-    z = z[
-        trim_mask
-    ]
+        processed_profiles.append({
+            "name": name,
+            "x": x_final,
+            "y": y_final,
+            "spike_mask": spikes_final
+        })
 
-    # --------------------------------------------------------
-    # SPIKE REMOVAL
-    # --------------------------------------------------------
-
-    z_clean, spike_mask = remove_spikes(
-        z,
-        s["spike_window"],
-        s["spike_threshold"],
-        s["spike_mode"]
-    )
-
-    num_spikes = int(
-        np.sum(spike_mask)
-    )
-
-    # --------------------------------------------------------
-    # Save summary
-    # --------------------------------------------------------
-
-    spike_summary.append({
-        "Profile": name,
-        "Mode": s["spike_mode"],
-        "Window": s["spike_window"],
-        "Threshold": s["spike_threshold"],
-        "Spikes Removed": num_spikes,
-        "Points Remaining": len(x)
-    })
-
-    # --------------------------------------------------------
-    # Store corrected dataframe
-    # --------------------------------------------------------
-
-    corrected = pd.DataFrame({
-        "Distance": x,
-        "Height": z_clean,
-        "OriginalHeight": z,
-        "SpikeRemoved": spike_mask
-    })
-
-    corrected_profiles.append(
-        corrected
-    )
-
-    # --------------------------------------------------------
-    # Profile information
-    # --------------------------------------------------------
-
-    st.write(
-        f"**{name}** — "
-        f"{len(x):,} points remaining; "
-        f"**{num_spikes:,} spikes removed**"
-    )
-
-    # --------------------------------------------------------
-    # Plot
-    # --------------------------------------------------------
-
-    fig, ax = plt.subplots(
-        figsize=(12, 4)
-    )
-
-    # Original trimmed
-    ax.plot(
-        x,
-        z,
-        linewidth=0.7,
-        alpha=0.7,
-        label="Trimmed original"
-    )
-
-    # Corrected
-    ax.plot(
-        x,
-        z_clean,
-        linewidth=1.2,
-        label="Corrected"
-    )
-
-    # --------------------------------------------------------
-    # RED SPIKE MARKERS
-    # --------------------------------------------------------
-
-    if num_spikes > 0:
-
-        ax.scatter(
-            x[spike_mask],
-            z[spike_mask],
-            s=20,
-            label=(
-                f"Removed spikes ({num_spikes})"
+        spike_summary.append({
+            "File": name,
+            "Points Before": len(x_original),
+            "Points After Edge Trim": len(x_final),
+            "Spikes Removed": int(
+                np.sum(spikes_final)
             ),
-            zorder=5
+            "Left Trim (µm)": left_trim,
+            "Right Trim (µm)": right_trim,
+            "X Shift (µm)": x_shift,
+            "Y Shift (Å)": y_shift,
+            "Spike Mode": spike_mode,
+            "Spike Window": spike_window,
+            "Spike Threshold": spike_threshold
+        })
+
+        # ----------------------------------------------------
+        # INDIVIDUAL CORRECTED PROFILE GRAPH
+        # ----------------------------------------------------
+
+        fig, ax = plt.subplots(
+            figsize=(10, 4)
         )
 
-    ax.set_xlabel(
-        "Distance (µm)"
-    )
+        ax.plot(
+            x_final,
+            y_final,
+            linewidth=1.0,
+            label="Corrected profile"
+        )
 
-    ax.set_ylabel(
-        "Height (Å)"
-    )
+        if np.any(spikes_final):
 
-    ax.set_title(
-        f"Corrected Profile — {name}"
-    )
+            ax.scatter(
+                x_final[spikes_final],
+                y_final[spikes_final],
+                s=12,
+                label="Removed spikes"
+            )
 
-    ax.grid(
-        alpha=0.25
-    )
+        ax.set_xlabel("Distance (µm)")
+        ax.set_ylabel("Height (Å)")
+        ax.set_title(
+            f"{name} — Corrected Profile"
+        )
 
-    ax.legend()
+        ax.grid(True, alpha=0.25)
+        ax.legend()
 
-    st.pyplot(
-        fig,
-        clear_figure=True
-    )
+        st.pyplot(
+            fig,
+            clear_figure=True
+        )
+
+        st.write(
+            f"**Points retained:** {len(x_final):,}  |  "
+            f"**Spikes removed:** {np.sum(spikes_final):,}"
+        )
 
 
 # ============================================================
 # SPIKE SUMMARY
 # ============================================================
 
-st.subheader(
-    "Spike Removal Summary"
-)
+st.header("3. Spike Removal Summary")
 
-spike_df = pd.DataFrame(
+spike_summary_df = pd.DataFrame(
     spike_summary
 )
 
 st.dataframe(
-    spike_df,
+    spike_summary_df,
     use_container_width=True
 )
 
 
 # ============================================================
-# AVERAGE
+# ALIGN PROFILES
 # ============================================================
 
-st.header(
-    "4. Average Profiles"
-)
-
+st.header("4. Alignment & Averaging")
 
 try:
 
-    common_x, aligned = (
-        interpolate_profiles(
-            corrected_profiles
-        )
+    common_x, interpolated = interpolate_profiles(
+        processed_profiles
     )
 
 except Exception as e:
 
-    st.error(
-        f"Could not align profiles: {e}"
-    )
-
+    st.error(str(e))
     st.stop()
 
 
-# ============================================================
-# AVERAGE
-# ============================================================
-
-average_height = np.mean(
-    aligned,
-    axis=0
-)
-
-average_std = np.std(
-    aligned,
-    axis=0
-)
-
-
-full_average = pd.DataFrame({
-    "Distance": common_x,
-    "AverageHeight": average_height,
-    "StdDev": average_std
-})
-
-
-# ============================================================
-# ALIGNED PROFILES PLOT
-# ============================================================
-
-st.subheader(
-    "Aligned Corrected Profiles"
-)
-
+# ------------------------------------------------------------
+# ALIGNED PROFILE GRAPH
+# ------------------------------------------------------------
 
 fig, ax = plt.subplots(
-    figsize=(12, 5)
+    figsize=(11, 5)
 )
 
+for i, p in enumerate(processed_profiles):
 
-for i, name in enumerate(
-    profile_names
-):
+    y_interp = interpolated[i]
 
     ax.plot(
         common_x,
-        aligned[i],
+        y_interp,
         linewidth=0.8,
-        alpha=0.65,
-        label=name
+        alpha=0.6,
+        label=p["name"]
     )
 
+ax.set_xlabel("Distance (µm)")
+ax.set_ylabel("Height (Å)")
+ax.set_title("Aligned Profiles")
 
-ax.set_xlabel(
-    "Distance (µm)"
-)
+ax.grid(True, alpha=0.25)
 
-ax.set_ylabel(
-    "Height (Å)"
-)
-
-ax.set_title(
-    "Aligned Corrected Profiles"
-)
-
-ax.grid(
-    alpha=0.25
-)
-
-ax.legend(
-    fontsize=8
-)
+if len(processed_profiles) <= 10:
+    ax.legend()
 
 st.pyplot(
     fig,
@@ -1468,54 +817,51 @@ st.pyplot(
 
 
 # ============================================================
-# FULL AVERAGE PLOT
+# FULL AVERAGE
 # ============================================================
 
-st.subheader(
-    "Full Average"
+average_y = np.mean(
+    interpolated,
+    axis=0
 )
 
+std_y = np.std(
+    interpolated,
+    axis=0
+)
+
+
+# ============================================================
+# FULL AVERAGE GRAPH
+# ============================================================
+
+st.subheader("Full Average Profile")
 
 fig, ax = plt.subplots(
-    figsize=(12, 5)
+    figsize=(11, 5)
 )
-
 
 ax.plot(
     common_x,
-    average_height,
+    average_y,
     linewidth=1.5,
     label="Average"
 )
 
-
 ax.fill_between(
     common_x,
-    average_height - average_std,
-    average_height + average_std,
+    average_y - std_y,
+    average_y + std_y,
     alpha=0.25,
     label="±1 SD"
 )
 
+ax.set_xlabel("Distance (µm)")
+ax.set_ylabel("Height (Å)")
+ax.set_title("Full Average Profile")
 
-ax.set_xlabel(
-    "Distance (µm)"
-)
-
-ax.set_ylabel(
-    "Height (Å)"
-)
-
-ax.set_title(
-    "Full Average Profile"
-)
-
-ax.grid(
-    alpha=0.25
-)
-
+ax.grid(True, alpha=0.25)
 ax.legend()
-
 
 st.pyplot(
     fig,
@@ -1527,444 +873,465 @@ st.pyplot(
 # FINAL AVERAGE TRIMMING
 # ============================================================
 
-st.header(
-    "5. Final Average Trimming"
+st.header("5. Final Average Adjustments")
+
+st.markdown("""
+These adjustments are applied **after averaging**. They only affect
+the final exported/used average profile and do not change the
+individual-profile averaging itself.
+""")
+
+
+# ------------------------------------------------------------
+# OUTPUT LABEL
+# ------------------------------------------------------------
+
+output_label = st.text_input(
+    "Final output label",
+    value="Y1",
+    help=(
+        "Enter only the label you want used for the final outputs, "
+        "for example Y1, Y2, Sample1, etc."
+    )
+).strip()
+
+
+# Make label safe for filenames
+safe_output_label = re.sub(
+    r"[^\w\-]+",
+    "_",
+    output_label
+).strip("_")
+
+if not safe_output_label:
+    safe_output_label = "Profile"
+
+
+st.caption(
+    f"Example output: {safe_output_label}_Final_Average.csv"
 )
 
-st.write(
-    "These cuts affect only the final average. "
-    "They do NOT change which data were used to calculate "
-    "the individual-profile average."
-)
 
+# ------------------------------------------------------------
+# FINAL TRIMMING
+# ------------------------------------------------------------
 
 col1, col2 = st.columns(2)
 
-
 with col1:
 
-    final_left = st.number_input(
-        "Final average left cut",
-        min_value=0.0,
+    final_left_trim = st.number_input(
+        "Final LEFT truncation (µm)",
         value=0.0,
-        step=0.01,
-        format="%.4f"
+        min_value=0.0,
+        step=1.0,
+        format="%.3f",
+        key="final_left_trim"
     )
-
 
 with col2:
 
-    final_right = st.number_input(
-        "Final average right cut",
-        min_value=0.0,
+    final_right_trim = st.number_input(
+        "Final RIGHT truncation (µm)",
         value=0.0,
-        step=0.01,
-        format="%.4f"
+        min_value=0.0,
+        step=1.0,
+        format="%.3f",
+        key="final_right_trim"
     )
 
 
 # ============================================================
-# APPLY FINAL TRIM
+# APPLY FINAL TRUNCATION
 # ============================================================
 
-final_xmin = (
-    common_x.min()
-    +
-    final_left
+final_keep = np.ones(
+    len(common_x),
+    dtype=bool
 )
 
-final_xmax = (
-    common_x.max()
-    -
-    final_right
+full_x_min = np.min(common_x)
+full_x_max = np.max(common_x)
+
+final_keep &= (
+    common_x
+    >= full_x_min + final_left_trim
 )
 
+final_keep &= (
+    common_x
+    <= full_x_max - final_right_trim
+)
 
-if final_xmin >= final_xmax:
+final_x = common_x[final_keep]
+final_y = average_y[final_keep]
+final_std = std_y[final_keep]
+
+
+if len(final_x) < 2:
 
     st.error(
-        "Final average trimming removes the entire profile."
+        "Final truncation removes too much of the profile. "
+        "Please reduce the left/right truncation."
     )
 
     st.stop()
 
 
-final_mask = (
-    (common_x >= final_xmin)
-    &
-    (common_x <= final_xmax)
-)
-
-
-final_x = common_x[
-    final_mask
-]
-
-final_y = average_height[
-    final_mask
-]
-
-final_sd = average_std[
-    final_mask
-]
-
-
 # ============================================================
-# METRICS
-# ============================================================
-
-metrics = calculate_metrics(
-    final_x,
-    final_y
-)
-
-
-# ============================================================
-# METRICS DISPLAY
-# ============================================================
-
-st.header(
-    "6. Final Profile Metrics"
-)
-
-
-col1, col2, col3 = st.columns(3)
-
-
-with col1:
-
-    st.metric(
-        "Ra",
-        f"{metrics['Ra']:.6g} Å"
-    )
-
-
-with col2:
-
-    st.metric(
-        "Rq",
-        f"{metrics['Rq']:.6g} Å"
-    )
-
-
-with col3:
-
-    st.metric(
-        "Rt",
-        f"{metrics['Rt']:.6g} Å"
-    )
-
-
-# ============================================================
-# FINAL PROFILE PLOT
+# FINAL GRAPH — IMMEDIATELY AFTER ADJUSTMENTS
 # ============================================================
 
 st.subheader(
-    "Final Truncated Average"
+    f"{safe_output_label} - Final Average Profile"
 )
-
 
 fig, ax = plt.subplots(
-    figsize=(12, 5)
+    figsize=(11, 5)
 )
-
 
 ax.plot(
     final_x,
     final_y,
-    linewidth=1.5,
+    linewidth=1.8,
     label="Final average"
 )
 
-
 ax.fill_between(
     final_x,
-    final_y - final_sd,
-    final_y + final_sd,
+    final_y - final_std,
+    final_y + final_std,
     alpha=0.25,
     label="±1 SD"
 )
 
-
-ax.set_xlabel(
-    "Distance (µm)"
-)
-
-ax.set_ylabel(
-    "Height (Å)"
-)
+ax.set_xlabel("Distance (µm)")
+ax.set_ylabel("Height (Å)")
 
 ax.set_title(
-    "Final Truncated Average Profile"
+    f"{safe_output_label} - Final Average Profile"
 )
 
-ax.grid(
-    alpha=0.25
-)
-
+ax.grid(True, alpha=0.25)
 ax.legend()
-
 
 st.pyplot(
     fig,
     clear_figure=True
 )
 
-
-# ============================================================
-# EXPORT SECTION
-# ============================================================
-
-st.header(
-    "7. Export Data"
+st.caption(
+    f"Final profile range: "
+    f"{final_x.min():.3f} to {final_x.max():.3f} µm  |  "
+    f"{len(final_x):,} points"
 )
 
 
 # ============================================================
-# FINAL AVERAGE CSV
+# FINAL METRICS
 # ============================================================
+
+st.header("6. Final Profile Metrics")
+
+metrics = calculate_metrics(
+    final_x,
+    final_y
+)
+
+metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+with metric_col1:
+
+    st.metric(
+        "Ra",
+        f"{metrics['Ra']:.4f} Å"
+    )
+
+with metric_col2:
+
+    st.metric(
+        "Rq",
+        f"{metrics['Rq']:.4f} Å"
+    )
+
+with metric_col3:
+
+    st.metric(
+        "Rt",
+        f"{metrics['Rt']:.4f} Å"
+    )
+
+
+# ============================================================
+# EXPORT DATA
+# ============================================================
+
+st.header("7. Export Results")
+
+
+# ------------------------------------------------------------
+# FINAL AVERAGE
+# ------------------------------------------------------------
 
 final_average_df = pd.DataFrame({
     "Distance_um": final_x,
     "AverageHeight_A": final_y,
-    "StdDev_A": final_sd
+    "StdDev_A": final_std
 })
 
-
-st.download_button(
-    label="Download Final Average CSV",
-    data=(
-        final_average_df
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Final_Average_Profile.csv",
-    mime="text/csv"
-)
+final_average_csv = final_average_df.to_csv(
+    index=False
+).encode("utf-8")
 
 
-# ============================================================
-# FULL AVERAGE CSV
-# ============================================================
+# ------------------------------------------------------------
+# FULL AVERAGE
+# ------------------------------------------------------------
 
-st.download_button(
-    label="Download Full Average CSV",
-    data=(
-        full_average
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Full_Average_Profile.csv",
-    mime="text/csv"
-)
+full_average_df = pd.DataFrame({
+    "Distance_um": common_x,
+    "AverageHeight_A": average_y,
+    "StdDev_A": std_y
+})
+
+full_average_csv = full_average_df.to_csv(
+    index=False
+).encode("utf-8")
 
 
-# ============================================================
-# ALIGNED PROFILES CSV
-# ============================================================
+# ------------------------------------------------------------
+# ALIGNED PROFILES
+# ------------------------------------------------------------
 
-aligned_df = pd.DataFrame({
+aligned_data = {
     "Distance_um": common_x
-})
+}
 
+for i, p in enumerate(processed_profiles):
 
-for i, name in enumerate(
-    profile_names
-):
+    aligned_data[p["name"]] = interpolated[i]
 
-    safe_name = (
-        name
-        .replace(".csv", "")
-        .replace(" ", "_")
-        .replace("-", "_")
-        .replace("(", "")
-        .replace(")", "")
-    )
-
-    aligned_df[
-        safe_name
-    ] = aligned[i]
-
-
-st.download_button(
-    label="Download Aligned Profiles CSV",
-    data=(
-        aligned_df
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Aligned_Profiles.csv",
-    mime="text/csv"
+aligned_df = pd.DataFrame(
+    aligned_data
 )
 
-
-# ============================================================
-# CORRECTED INDIVIDUAL PROFILES CSV
-# ============================================================
-
-corrected_combined = []
+aligned_csv = aligned_df.to_csv(
+    index=False
+).encode("utf-8")
 
 
-for name, profile in zip(
-    profile_names,
-    corrected_profiles
-):
+# ------------------------------------------------------------
+# CORRECTED INDIVIDUAL PROFILES
+# ------------------------------------------------------------
 
-    temp = profile.copy()
+corrected_data = []
 
-    temp.insert(
-        0,
-        "Profile",
-        name
-    )
+for p in processed_profiles:
 
-    corrected_combined.append(
-        temp
-    )
+    temp_df = pd.DataFrame({
+        "File": p["name"],
+        "Distance_um": p["x"],
+        "CorrectedHeight_A": p["y"],
+        "SpikeRemoved": p["spike_mask"]
+    })
 
+    corrected_data.append(temp_df)
 
 corrected_df = pd.concat(
-    corrected_combined,
+    corrected_data,
     ignore_index=True
 )
 
-
-st.download_button(
-    label="Download Corrected Individual Profiles",
-    data=(
-        corrected_df
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Corrected_Individual_Profiles.csv",
-    mime="text/csv"
-)
+corrected_csv = corrected_df.to_csv(
+    index=False
+).encode("utf-8")
 
 
-# ============================================================
-# METRICS CSV
-# ============================================================
+# ------------------------------------------------------------
+# METRICS
+# ------------------------------------------------------------
 
 metrics_df = pd.DataFrame([
     {
-        "Metric": "Ra",
-        "Value_A": metrics["Ra"]
-    },
-    {
-        "Metric": "Rq",
-        "Value_A": metrics["Rq"]
-    },
-    {
-        "Metric": "Rt",
-        "Value_A": metrics["Rt"]
+        "Label": safe_output_label,
+        "Ra_A": metrics["Ra"],
+        "Rq_A": metrics["Rq"],
+        "Rt_A": metrics["Rt"],
+        "Points": len(final_x),
+        "X_Start_um": final_x.min(),
+        "X_End_um": final_x.max(),
+        "Final_Left_Truncation_um": final_left_trim,
+        "Final_Right_Truncation_um": final_right_trim
     }
 ])
 
+metrics_csv = metrics_df.to_csv(
+    index=False
+).encode("utf-8")
 
-st.download_button(
-    label="Download Metrics CSV",
-    data=(
-        metrics_df
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Profile_Metrics.csv",
-    mime="text/csv"
+
+# ------------------------------------------------------------
+# SPIKE SUMMARY
+# ------------------------------------------------------------
+
+spike_summary_csv = spike_summary_df.to_csv(
+    index=False
+).encode("utf-8")
+
+
+# ============================================================
+# DOWNLOAD BUTTONS
+# ============================================================
+
+st.subheader("Downloads")
+
+download_col1, download_col2 = st.columns(2)
+
+with download_col1:
+
+    st.download_button(
+        label="Download Final Average",
+        data=final_average_csv,
+        file_name=f"{safe_output_label}_Final_Average.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    st.download_button(
+        label="Download Full Average",
+        data=full_average_csv,
+        file_name=f"{safe_output_label}_Full_Average.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    st.download_button(
+        label="Download Aligned Profiles",
+        data=aligned_csv,
+        file_name=f"{safe_output_label}_Aligned_Profiles.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+with download_col2:
+
+    st.download_button(
+        label="Download Corrected Individual Profiles",
+        data=corrected_csv,
+        file_name=(
+            f"{safe_output_label}_"
+            "Corrected_Individual_Profiles.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    st.download_button(
+        label="Download Profile Metrics",
+        data=metrics_csv,
+        file_name=f"{safe_output_label}_Profile_Metrics.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    st.download_button(
+        label="Download Spike Removal Summary",
+        data=spike_summary_csv,
+        file_name=(
+            f"{safe_output_label}_"
+            "Spike_Removal_Summary.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+# ============================================================
+# EXPORT PREVIEW
+# ============================================================
+
+st.subheader("Export Naming Preview")
+
+preview_names = pd.DataFrame({
+    "Output": [
+        "Final Average",
+        "Full Average",
+        "Aligned Profiles",
+        "Corrected Individual Profiles",
+        "Profile Metrics",
+        "Spike Removal Summary"
+    ],
+    "Filename": [
+        f"{safe_output_label}_Final_Average.csv",
+        f"{safe_output_label}_Full_Average.csv",
+        f"{safe_output_label}_Aligned_Profiles.csv",
+        f"{safe_output_label}_Corrected_Individual_Profiles.csv",
+        f"{safe_output_label}_Profile_Metrics.csv",
+        f"{safe_output_label}_Spike_Removal_Summary.csv"
+    ]
+})
+
+st.dataframe(
+    preview_names,
+    hide_index=True,
+    use_container_width=True
 )
 
 
 # ============================================================
-# SPIKE SUMMARY CSV
+# SPIKE REMOVAL GUIDE
 # ============================================================
 
-st.download_button(
-    label="Download Spike Removal Summary",
-    data=(
-        spike_df
-        .to_csv(index=False)
-        .encode("utf-8")
-    ),
-    file_name="Spike_Removal_Summary.csv",
-    mime="text/csv"
-)
+with st.expander("Spike Removal Guide"):
 
-
-# ============================================================
-# INSTRUCTIONS
-# ============================================================
-
-st.divider()
-
-st.header(
-    "Spike Removal Guide"
-)
-
-st.markdown(
-    """
-### Recommended starting settings
-
-**Spike mode:** High spikes only  
-**Spike window:** 7  
-**Spike threshold:** 5.0
-
-### What the settings do
-
-**High spikes only**
-
-Removes points that are unusually high compared with
-their local surroundings. This is the recommended setting
-if your main problem is isolated upward artifacts.
-
-**Low spikes only**
-
-Removes unusually low points.
-
-**High + low spikes**
-
-Removes unusually high AND unusually low points.
+    st.markdown("""
+### Spike removal
 
 **Off**
+- No spike removal is performed.
 
-No spike correction is performed.
+**High spikes only**
+- Removes isolated upward spikes.
+- This is the recommended default if your main problem is
+  occasional high profilometer spikes.
 
-### Threshold
+**Low spikes only**
+- Removes isolated downward spikes.
 
-A lower threshold is more aggressive.
+**High + low spikes**
+- Removes both upward and downward isolated spikes.
 
-| Threshold | Behavior |
-|---|---|
-| 3–4 | Aggressive |
-| 5 | Good starting point |
-| 6–7 | Conservative |
-| 8–10 | Very conservative |
+### Local median window
 
-### Window
+This determines how many neighboring points are used to estimate
+the local expected profile.
 
-The window controls the local region used to determine
-what the profile should look like.
+Typical starting values:
 
-| Window | Best for |
-|---|---|
-| 3–5 | Very narrow spikes |
-| 7 | Isolated spikes — recommended starting point |
-| 9–15 | Wider artifacts |
-| 17+ | Very broad deviations |
+- 7–11: aggressive/local correction
+- 11–21: good general starting range
+- 21–51: smoother profiles with broader features
 
-Be careful with very large windows because legitimate
-profile features can eventually be interpreted as spikes.
+### Spike threshold
 
-### Important
+Higher values are more conservative.
 
-The red points shown on each individual profile are the
-points that were identified as spikes.
+Typical starting values:
 
-Those points are replaced with the local median **before
-the profile enters the averaging calculation**.
+- 3–4: aggressive
+- 5: good default
+- 6–8: conservative
+- 10+: only very extreme spikes
 
-Individual left/right cuts are also applied before averaging.
+The removed points are shown in red on the individual profile plots.
+""")
 
-Final-average trimming occurs afterward and only changes
-the portion of the already-calculated average that is
-reported/exported.
-"""
+
+# ============================================================
+# END
+# ============================================================
+
+st.success(
+    f"Ready — final output label is **{safe_output_label}**."
 )
